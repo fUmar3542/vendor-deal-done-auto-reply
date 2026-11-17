@@ -1,0 +1,32 @@
+# check present working address
+pwd
+
+# set cronjob
+* * * * * cd /Users/you/dealbot && /usr/bin/python3 dealbot.py >> dealbot.log 2>&1
+
+The five stars: when it runs
+* * * * *
+│ │ │ │ └─ day of week (0-7, Sunday is 0 or 7)
+│ │ │ └─── month (1-12)
+│ │ └───── day of month (1-31)
+│ └─────── hour (0-23)
+└───────── minute (0-59)
+
+A * means “every”. Five stars therefore mean every minute of every hour of every day, so the bot runs once a minute, all the time.
+
+Some other schedules:
+
+Schedule	        Meaning
+*/5 * * * *	        every 5 minutes
+0 * * * *	        at the top of every hour
+0 9 * * *	        every day at 9:00 AM
+*/2 9-18 * * 1-5	every 2 minutes, 9 AM to 6 PM, Monday to Friday
+
+## check cronjob
+crontab -l
+
+## stop cronjob
+crontab -l
+Esc
+dd
+:wq

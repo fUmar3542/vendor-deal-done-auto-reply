@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-RankZeek guest-post deal bot v3  (mailbox: info@rankzeek.com)  -  fully automatic
+RankZeek guest-post deal bot v3.1  (mailbox: info@rankzeek.com)  -  fully automatic
+
+v3.1 changes:
+  - A vendor we walked away from ("close" / "final" was our last message) who comes back
+    with a price inside our budget is reopened and gets a deal.
+  - Mail we already handled / ignore is marked as read, so it is not re-read every minute.
 
 How it works (each run):
   1. Reads UNSEEN vendor emails (recent only), skips bounces/newsletters/no-reply.
@@ -193,7 +198,7 @@ def chat(prov: str, base: str, key: str, model: str, messages: list, temperature
         headers={
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "User-Agent": "rankzeek-dealbot/3.0",  # some providers sit behind Cloudflare
+            "User-Agent": "rankzeek-dealbot/3.1",  # some providers sit behind Cloudflare
         },
     )
     try:
@@ -816,12 +821,22 @@ def close_vendor(db, vendor: str, outcome: str, price, dry: bool) -> None:
 
 
 def reopen(db, vendor: str) -> None:
+    """Forget that a vendor was closed. sent_log is kept, so our last offer is still known."""
     vendor = vendor.lower()
     db.execute("DELETE FROM scheduled WHERE message_id IN (SELECT message_id FROM handled WHERE vendor=?)", (vendor,))
     db.execute("DELETE FROM handled WHERE vendor=?", (vendor,))
     db.execute("DELETE FROM closed WHERE vendor=?", (vendor,))
     db.execute("DELETE FROM vendor_prices WHERE vendor=?", (vendor,))
     db.commit()
+
+
+def mark_read(imap, uid: bytes, dry: bool) -> None:
+    if dry:
+        return
+    try:
+        imap.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+    except Exception as e:
+        log(f"  could not mark as read: {e}")
 
 
 def process_one(db, imap, uid: bytes, dry: bool) -> str:
@@ -835,6 +850,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
     mid = str(msg["Message-ID"] or f"uid-{uid.decode()}").strip()
     if db.execute("SELECT 1 FROM handled WHERE message_id=?", (mid,)).fetchone():
         log(f"  already handled, ignoring: {mid}")
+        mark_read(imap, uid, dry)   # v3.1: stop re-reading it every minute
         return "noop"
 
     from_name, from_addr = email.utils.parseaddr(str(msg.get("From") or ""))
@@ -851,11 +867,24 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         return "skipped"
 
     row = db.execute("SELECT outcome, price FROM closed WHERE vendor=?", (vendor,)).fetchone()
+
+    # v3.1: a vendor we walked away from may come back with a price we can accept
+    if row and row[0] == "ended":
+        last = db.execute("SELECT kind FROM sent_log WHERE vendor=? ORDER BY id DESC LIMIT 1", (vendor,)).fetchone()
+        body_now = clean_body(msg)
+        amts = money_amounts(body_now)
+        if last and last[0] in ("close", "final") and amts and max(amts) <= MAX_PRICE and not STOP_RE.search(body_now):
+            log(f"  {vendor} came back with ${min(amts):g}, inside budget; reopening")
+            if not dry:
+                reopen(db, vendor)
+            row = None
+
     if row:
         if row[0] == "deal_done":
             print(f"DEAL FOLLOW-UP: {vendor} wrote again after the deal (${(row[1] or 0):g}). Left unread for you to see.")
         else:
             log(f"  vendor already closed ({row[0]}); not replying. Use --reopen {vendor} to resume.")
+            mark_read(imap, uid, dry)   # v3.1: stop re-reading it every minute
         mark(db, mid, vendor, "closed:" + row[0], dry)
         return "skipped"
 
@@ -927,6 +956,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         print(f"CLOSED: {vendor} - hostile, asked us to stop, or no price after {MAX_CLARIFY} tries. No reply sent.")
         close_vendor(db, vendor, "ended", None, dry)
         mark(db, mid, vendor, "none", dry)
+        mark_read(imap, uid, dry)
         return "skipped"
 
     # AI call 2: write the email
