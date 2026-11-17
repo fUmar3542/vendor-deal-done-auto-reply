@@ -2,6 +2,7 @@
 pwd
 
 # set cronjob
+crontab -e
 * * * * * cd /Users/you/dealbot && /usr/bin/python3 dealbot.py >> dealbot.log 2>&1
 
 The five stars: when it runs
@@ -25,8 +26,11 @@ Schedule	        Meaning
 ## check cronjob
 crontab -l
 
+## review logs
+tail -f dealbot.log
+
 ## stop cronjob
-crontab -l
+crontab -e
 Esc
 dd
 :wq
