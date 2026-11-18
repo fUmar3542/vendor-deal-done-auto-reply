@@ -1,0 +1,4 @@
+.env
+dealbot.db
+dealbot.lock
+deals.csv
