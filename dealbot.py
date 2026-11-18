@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-RankZeek guest-post deal bot v3.2  (mailbox: info@rankzeek.com)  -  fully automatic
+RankZeek guest-post deal bot v3.3  (mailbox: info@rankzeek.com)  -  fully automatic
+
+v3.3 changes:
+  - New LAST strategy: when the vendor's price is far above our budget and they will not move
+    (even after we said "X is the most we can do"), the bot asks "what is your lowest final price?".
+      * their final price is inside budget  -> deal (accepted at that price, sheet updated)
+      * their final price is above budget   -> polite close ("we'll keep your rate on file"),
+                                               and NOTIFY_EMAIL gets an email with their final price
+  - A vendor closed with "close_final" who later comes back with a price inside budget is reopened.
 
 v3.2 changes:
   - When a deal is done, the bot finds the first email we sent in that thread, asks the AI which
@@ -24,7 +32,9 @@ How it works (each run):
        - vendor price <= what we offered         -> accept at the vendor's (lower) price
        - vendor is firm / repeating / within $2  -> accept if inside budget
        - vendor price too high                   -> counter with a variable step toward them
-       - above budget and firm                   -> "X is the most we can do", then a polite goodbye
+       - above budget and firm                   -> "X is the most we can do"
+       - still above budget after that           -> ask for their lowest FINAL price (last strategy)
+       - final price above budget                -> polite goodbye + email to the owner
        - vendor declines                         -> one short polite goodbye (silent if hostile / "stop emailing")
   5. AI call #2 only WRITES the email in a casual, human tone. Code checks the text
      (no wrong amounts, no AI-sounding phrases, no links). If the AI fails, a template is used.
@@ -227,7 +237,7 @@ def chat(prov: str, base: str, key: str, model: str, messages: list, temperature
         headers={
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "User-Agent": "rankzeek-dealbot/3.2",  # some providers sit behind Cloudflare
+            "User-Agent": "rankzeek-dealbot/3.3",  # some providers sit behind Cloudflare
         },
     )
     try:
@@ -534,6 +544,9 @@ def decide(an: dict, price, offers_made: int, last_offer, cnt: dict, vendor_text
       stuck  -> same price as their last email: accept if inside budget, else say our max
       moved  -> they dropped their price: small step (pressure works)
       else   -> bigger variable step toward them
+
+    LAST strategy (v3.3): if the vendor is still above budget after we said "X is the most we can do",
+    we ask for their lowest FINAL price. Their answer is accepted if inside budget, otherwise we close politely.
     """
     if an["intent"] == "hostile" or STOP_RE.search(vendor_text):
         return "none", None, "ended"            # stay silent
@@ -553,12 +566,18 @@ def decide(an: dict, price, offers_made: int, last_offer, cnt: dict, vendor_text
         stuck = prev_vendor_price is not None and price >= prev_vendor_price
         start = last_offer if last_offer is not None else OPEN_PRICE
 
+        # v3.3: we already asked for their final price, so this email is their answer
+        if cnt.get("ask_final", 0) >= 1:
+            if price <= MAX_PRICE:
+                return "accept", price, "deal"
+            return "close_final", None, "ended"
+
         if price <= start:                                   # they are at or below what we offered
             return "accept", price, "deal"
         if price <= MAX_PRICE and (firm or stuck or price - start <= 2):
             return "accept", price, "deal"                   # inside budget and they won't move / nearly there
         if price > MAX_PRICE and cnt.get("final", 0) >= 1:   # we already said our max once
-            return "close", None, "ended"
+            return "ask_final", None, "open"                 # v3.3: last strategy, ask for their final price
         if last_offer is None and not firm:                  # first real move: open low
             return "counter", OPEN_PRICE, "open"
 
@@ -624,13 +643,17 @@ MODE_TEXT = {
     "offer": "Tell them our budget for a single post is ${price}. {df}",
     "counter": "Politely say that's a bit above what we can do and that our budget for this one is ${price}. Do not repeat or mention their price. Ask if that could work.",
     "final": "Say ${price} is the most we can do for this one and ask if they can make it work. Do not mention any other amount.",
-    "accept": "Agree to ${price} for one post. Say we'll be in touch soon about the post. {df}Ask roughly how long until it goes live. Do NOT mention payment at all.",    "ask_usd": "They quoted in another currency. Ask them to give the price in USD. Do not convert it and do not mention any amount.",
+    "accept": "Agree to ${price} for one post. Say we'll be in touch soon about the post. {df}Ask roughly how long until it goes live. Do NOT mention payment at all.",
+    "ask_usd": "They quoted in another currency. Ask them to give the price in USD. Do not convert it and do not mention any amount.",
     "ask_single": "They sent packages or bundles. Ask for the price of just one single post. Do not mention any amount.",
     "ask_dofollow": "They said the link would be nofollow. Say we only really work with dofollow links and ask if a dofollow link is possible. Do not mention any amount.",
     "close": "Politely pass on this one. Thank them for the quick answers and say it's a bit over what we can do right now. Do not mention any amount.",
     "goodbye": "They are not interested. Say no worries, thanks for letting us know, in one or two short sentences. Do not mention any amount and do not try to persuade them.",
     "clarify": "Answer what they asked in one or two sentences using only the facts you have. Then ask the price for one post in USD. Do not mention any amount.",
     "reminder": "Answer what they asked in a sentence or two using only the facts you have. Then say our budget of ${price} for a single post still stands and ask if that works.",
+    # v3.3: last strategy
+    "ask_final": "Say we're still a bit apart on price and ask what the lowest final price is that they could do for one post. Do not mention any amount.",
+    "close_final": "Thank them for the final price. Say it's above what we can do right now, we'll keep their rate on file and reach out if that changes. Do not mention any amount.",
 }
 
 FALLBACK = {
@@ -659,6 +682,11 @@ FALLBACK = {
                 "Happy to go through that once the price is settled. What's your price for a single post?"],
     "reminder": ["I'll sort out the other details once we agree on price. Our budget for one post is ${price}, does that work for you?",
                  "We'll cover that once the price is settled. Does ${price} for a single post work on your side?"],
+    # v3.3: last strategy
+    "ask_final": ["We're still a bit apart on price. What's the lowest final price you could do for one post?",
+                  "Seems we're not quite there yet. Could you tell me your best final price for a single post?"],
+    "close_final": ["Thanks for the final price. It's above what we can do right now, but I'll keep your rate on file and get back to you if that changes.",
+                    "Appreciate you sharing that. It's over our budget for now, so I'll keep it on file and reach out if things change."],
 }
 
 STYLE_HINTS = [
@@ -1122,11 +1150,12 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
     row = db.execute("SELECT outcome, price FROM closed WHERE vendor=?", (vendor,)).fetchone()
 
     # v3.1: a vendor we walked away from may come back with a price we can accept
+    # v3.3: "close_final" (we asked for their final price and it was too high) counts too
     if row and row[0] == "ended":
         last = db.execute("SELECT kind FROM sent_log WHERE vendor=? ORDER BY id DESC LIMIT 1", (vendor,)).fetchone()
         body_now = clean_body(msg)
         amts = money_amounts(body_now)
-        if last and last[0] in ("close", "final") and amts and max(amts) <= MAX_PRICE and not STOP_RE.search(body_now):
+        if last and last[0] in ("close", "final", "close_final") and amts and max(amts) <= MAX_PRICE and not STOP_RE.search(body_now):
             log(f"  {vendor} came back with ${min(amts):g}, inside budget; reopening")
             if not dry:
                 reopen(db, vendor)
@@ -1233,6 +1262,14 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
     elif outcome == "ended":
         log(f"CLOSED: {anon(vendor)} - negotiation ended (final message sent).")
         close_vendor(db, vendor, "ended", None, dry)
+        # v3.3: they gave a final price that is still above budget -> tell the owner
+        if mode == "close_final" and price is not None and not dry:
+            notify(f"{vendor} gave a final price of ${fmt_price(price)} (above budget)", [
+                f"Vendor      : {from_name or '-'} <{vendor}>",
+                f"Their final : ${fmt_price(price)} per guest post",
+                f"Our budget  : ${fmt_price(OPEN_PRICE)}-${fmt_price(MAX_PRICE)}",
+                "Status      : above budget, thread closed politely, rate kept on file.",
+                "Reply to them yourself if you want to accept."])
 
     mark(db, mid, vendor, mode, dry)
     return "sent"
