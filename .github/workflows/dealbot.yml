@@ -12,6 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    environment: Vendor auto reply env
     timeout-minutes: 10
     steps:
       - name: Checkout
