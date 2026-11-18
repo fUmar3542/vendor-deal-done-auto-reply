@@ -92,7 +92,7 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-EMAIL_ADDRESS = env("EMAIL_ADDRESS", "info@rankzeek.com").lower()
+EMAIL_ADDRESS = env("EMAIL_ADDRESS", "info@email.com").lower()
 EMAIL_PASSWORD = env("EMAIL_PASSWORD")
 IMAP_HOST = env("IMAP_HOST", "premium152.web-hosting.com")
 IMAP_PORT = int(env("IMAP_PORT", "993"))
@@ -104,7 +104,7 @@ SENDER_NAME = env("SENDER_NAME", "Sophia William")
 # v3.2: Google Sheet write-back + owner notifications
 SHEET_WEBAPP_URL = env("SHEET_WEBAPP_URL")            # Apps Script web app URL (ends with /exec)
 SHEET_SECRET = env("SHEET_SECRET")                    # same value as SECRET in Code.gs
-NOTIFY_EMAIL = env("NOTIFY_EMAIL", "baber2020888@gmail.com")
+NOTIFY_EMAIL = env("NOTIFY_EMAIL", "email@gmail.com")
 NOTIFY_ON_SUCCESS = env("NOTIFY_ON_SUCCESS", "0") == "1"   # also email you when the sheet update worked
 
 OPEN_PRICE = float(env("OPEN_PRICE", "10"))   # first counter-offer
@@ -132,11 +132,24 @@ PROVIDER_DEFAULTS = {
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", ""),  # set OPENROUTER_MODEL
 }
 
+# Privacy for public repos: no vendor emails, names or prices in the logs
+LOG_PRIVACY = env("LOG_PRIVACY", "1") == "1"
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
 
 # --------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------
+def anon(vendor: str) -> str:
+    """Short stable ID instead of the real email, so you can still follow one vendor across runs."""
+    if not LOG_PRIVACY:
+        return vendor
+    return "vendor-" + hashlib.sha256((EMAIL_PASSWORD + vendor.lower()).encode()).hexdigest()[:6]
+
+
 def log(msg: str) -> None:
+    if LOG_PRIVACY:
+        msg = _EMAIL_RE.sub("<email>", msg)   # safety net: no email address can reach the logs
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
@@ -794,17 +807,20 @@ def send_reply(imap, original, to_addr: str, body: str, dry: bool) -> None:
 def print_deal(vendor_name: str, vendor: str, price: float, dofollow, note: str) -> None:
     line = "=" * 64
     df = {True: "yes", False: "NO", None: "not confirmed yet"}[dofollow if dofollow in (True, False) else None]
-    print(
-        f"\n{line}\n"
-        f"DEAL DONE\n"
-        f"  Vendor   : {vendor_name or '-'} <{vendor}>\n"
-        f"  Price    : ${price:g} per article (budget ${OPEN_PRICE:g}-${MAX_PRICE:g})\n"
-        f"  Dofollow : {df}\n"
-        f"  Message  : Agreed with {vendor} at ${price:g} per guest post - within budget.\n"
-        f"  Note     : {note or '-'}\n"
-        f"{line}\n",
-        flush=True,
-    )
+    if LOG_PRIVACY:
+        print(f"\n{line}\nDEAL DONE with {anon(vendor)} (details are in the sheet / notification email)\n{line}\n", flush=True)
+    else:
+        print(
+            f"\n{line}\n"
+            f"DEAL DONE\n"
+            f"  Vendor   : {vendor_name or '-'} <{vendor}>\n"
+            f"  Price    : ${price:g} per article (budget ${OPEN_PRICE:g}-${MAX_PRICE:g})\n"
+            f"  Dofollow : {df}\n"
+            f"  Message  : Agreed with {vendor} at ${price:g} per guest post - within budget.\n"
+            f"  Note     : {note or '-'}\n"
+            f"{line}\n",
+            flush=True,
+        )
     path = BASE / "deals.csv"
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
@@ -819,6 +835,8 @@ def print_deal(vendor_name: str, vendor: str, price: float, dofollow, note: str)
 # ==========================================================================
 def notify(subject: str, lines: list) -> None:
     """Email the owner (NOTIFY_EMAIL). Never raises, so it can never break a run."""
+    if not NOTIFY_EMAIL:
+        return
     try:
         msg = EmailMessage()
         msg["From"] = email.utils.formataddr((SENDER_NAME + " (dealbot)", EMAIL_ADDRESS))
@@ -831,7 +849,7 @@ def notify(subject: str, lines: list) -> None:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=60) as s:
             s.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             s.send_message(msg)
-        log(f"  notification sent to {NOTIFY_EMAIL}: {subject}")
+        log("  notification email sent to the owner")
     except Exception as e:
         log(f"  could not send notification email: {e!r}")
 
@@ -973,7 +991,7 @@ def sheet_update(db, imap, vendor: str, from_addr: str, cur_msg, price: float,
         f"Time        : {datetime.now().isoformat(timespec='seconds')}",
     ]
     if dry:
-        log(f"  [dry run] would write {price_txt} for {vendor} into the sheet")
+        log(f"  [dry run] would write the price for {anon(vendor)} into the sheet")
         return
     if not (SHEET_WEBAPP_URL and SHEET_SECRET):
         log("  sheet update skipped: SHEET_WEBAPP_URL / SHEET_SECRET are not set in .env")
@@ -1017,7 +1035,9 @@ def sheet_update(db, imap, vendor: str, from_addr: str, cur_msg, price: float,
             if res.get("previous"):
                 msg += f" (overwrote previous price: {res['previous']})"
             log("  " + msg)
-            print("SHEET UPDATED: " + msg, flush=True)
+            log(f"  sheet updated for {anon(vendor)}" if LOG_PRIVACY else "  " + msg)
+            if not LOG_PRIVACY:
+                print("SHEET UPDATED: " + msg, flush=True)
             if NOTIFY_ON_SUCCESS:
                 notify(f"Deal done with {vendor} at {price_txt} - sheet updated", details + ["", msg])
         elif res.get("code") == "not_found":
@@ -1027,7 +1047,7 @@ def sheet_update(db, imap, vendor: str, from_addr: str, cur_msg, price: float,
         else:
             raise RuntimeError(f"Apps Script said: {res.get('error') or res}")
     except Exception as e:
-        log(f"  sheet update failed: {e!r}")
+        log(f"  sheet update failed ({type(e).__name__}); details sent by email")
         notify(f"Deal done with {vendor} - SHEET UPDATE FAILED", details + [
             "", f"Error: {e!r}", f"Please enter {price_txt} for this vendor in the sheet manually."])
 
@@ -1091,8 +1111,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
     from_addr = from_addr.lower()
     _, reply_addr = email.utils.parseaddr(str(msg.get("Reply-To") or ""))
     vendor = (reply_addr or from_addr).lower()
-    subject = str(msg.get("Subject") or "")[:70]
-    log(f"Email from {vendor} | {subject}")
+    log(f"Email from {anon(vendor)}")
 
     why = skip_reason(msg, from_addr)
     if why:
@@ -1115,16 +1134,16 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
 
     if row:
         if row[0] == "deal_done":
-            print(f"DEAL FOLLOW-UP: {vendor} wrote again after the deal (${(row[1] or 0):g}). Left unread for you to see.")
+            log(f"DEAL FOLLOW-UP: {anon(vendor)} wrote again after the deal. Left unread for you to see.")
         else:
-            log(f"  vendor already closed ({row[0]}); not replying. Use --reopen {vendor} to resume.")
+            log(f"  {anon(vendor)} already closed ({row[0]}); not replying.")
             mark_read(imap, uid, dry)   # v3.1: stop re-reading it every minute
         mark(db, mid, vendor, "closed:" + row[0], dry)
         return "skipped"
 
     n_sent = db.execute("SELECT COUNT(*) FROM sent_log WHERE vendor=?", (vendor,)).fetchone()[0]
     if n_sent >= MAX_REPLIES_PER_VENDOR:
-        log(f"  {vendor} reached the {MAX_REPLIES_PER_VENDOR}-reply safety cap; closing it.")
+        log(f"  {anon(vendor)} reached the reply safety cap; closing it.")
         mark(db, mid, vendor, "capped", dry)
         close_vendor(db, vendor, "capped", None, dry)
         return "skipped"
@@ -1187,7 +1206,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         f"-> {mode} {out_price if out_price is not None else ''} ({outcome})")
 
     if mode == "none":
-        print(f"CLOSED: {vendor} - hostile, asked us to stop, or no price after {MAX_CLARIFY} tries. No reply sent.")
+        log(f"CLOSED: {anon(vendor)} - hostile, asked us to stop, or no price after several tries. No reply sent.")
         close_vendor(db, vendor, "ended", None, dry)
         mark(db, mid, vendor, "none", dry)
         mark_read(imap, uid, dry)
@@ -1204,7 +1223,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         if price is not None:   # remembered only after a successful send, so retries are not counted as "stuck"
             db.execute("INSERT INTO vendor_prices(vendor, ts, price) VALUES(?,?,?)", (vendor, time.time(), price))
         db.commit()
-    log(f"  reply {'(dry run) ' if dry else ''}sent to {vendor} [{mode}, written by {wprov}]")
+    log(f"  reply {'(dry run) ' if dry else ''}sent to {anon(vendor)} [{mode}, written by {wprov}]")
 
     if outcome == "deal":
         print_deal(from_name, vendor, out_price, an["dofollow"], f"agreed after {offers_made} offer(s)")
@@ -1212,7 +1231,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         # v3.2: write the price into the Google Sheet (never raises; emails NOTIFY_EMAIL on problems)
         sheet_update(db, imap, vendor, from_addr, msg, out_price, from_name, an["dofollow"], dry)
     elif outcome == "ended":
-        print(f"CLOSED: {vendor} - negotiation ended (final message sent).")
+        log(f"CLOSED: {anon(vendor)} - negotiation ended (final message sent).")
         close_vendor(db, vendor, "ended", None, dry)
 
     mark(db, mid, vendor, mode, dry)
@@ -1249,6 +1268,9 @@ def main() -> int:
 
     if not EMAIL_PASSWORD:
         print("EMAIL_PASSWORD is missing in .env")
+        return 1
+    if OPEN_PRICE <= 0 or MAX_PRICE <= 0:
+        print("OPEN_PRICE and MAX_PRICE must be set in Actions variables.")
         return 1
     usable = [p for p in AI_ORDER if all(provider_settings(p))]
     if not usable:
