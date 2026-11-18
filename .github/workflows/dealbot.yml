@@ -1,0 +1,83 @@
+name: dealbot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: dealbot
+  cancel-in-progress: false      # never run two at once
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore bot memory
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dealbot.db
+            deals.csv
+          key: dealbot-state-none
+          restore-keys: dealbot-state-
+
+      - name: Run bot
+        run: python dealbot.py
+        env:
+          # ---------- Secrets ----------
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GROQ_API_KEYS: ${{ secrets.GROQ_API_KEYS }}
+          SHEET_WEBAPP_URL: ${{ secrets.SHEET_WEBAPP_URL }}
+          SHEET_SECRET: ${{ secrets.SHEET_SECRET }}
+
+          # ---------- Mailbox ----------
+          EMAIL_ADDRESS: ${{ vars.EMAIL_ADDRESS || 'info@rankzeek.com' }}
+          IMAP_HOST: ${{ vars.IMAP_HOST || 'premium152.web-hosting.com' }}
+          IMAP_PORT: ${{ vars.IMAP_PORT || '993' }}
+          SMTP_HOST: ${{ vars.SMTP_HOST || 'premium152.web-hosting.com' }}
+          SMTP_PORT: ${{ vars.SMTP_PORT || '465' }}
+          SENT_FOLDER: ${{ vars.SENT_FOLDER || 'INBOX.Sent' }}
+          SENDER_NAME: ${{ vars.SENDER_NAME || 'Sophia William' }}
+
+          # ---------- Negotiation ----------
+          OPEN_PRICE: ${{ vars.OPEN_PRICE || '10' }}
+          MAX_PRICE: ${{ vars.MAX_PRICE || '20' }}
+          MAX_SENDS_PER_DAY: ${{ vars.MAX_SENDS_PER_DAY || '100' }}
+          PAYMENT_METHODS: ${{ vars.PAYMENT_METHODS || 'PayPal, Wise, Payoneer' }}
+          AUTO_SUBMITTED_HEADER: ${{ vars.AUTO_SUBMITTED_HEADER || '0' }}
+
+          # ---------- Notifications ----------
+          NOTIFY_EMAIL: ${{ vars.NOTIFY_EMAIL || 'baber2020888@gmail.com' }}
+          NOTIFY_ON_SUCCESS: ${{ vars.NOTIFY_ON_SUCCESS || '0' }}
+
+          # ---------- Timing ----------
+          ONLY_SINCE_DAYS: ${{ vars.ONLY_SINCE_DAYS || '14' }}
+          REPLY_DELAY_MIN_MINUTES: ${{ vars.REPLY_DELAY_MIN_MINUTES || '1' }}
+          REPLY_DELAY_MAX_MINUTES: ${{ vars.REPLY_DELAY_MAX_MINUTES || '4' }}
+          DELAY_MIN_SECONDS: ${{ vars.DELAY_MIN_SECONDS || '5' }}
+          DELAY_MAX_SECONDS: ${{ vars.DELAY_MAX_SECONDS || '20' }}
+          MAX_REPLIES_PER_VENDOR: ${{ vars.MAX_REPLIES_PER_VENDOR || '30' }}
+          MAX_CLARIFY: ${{ vars.MAX_CLARIFY || '10' }}
+
+          # ---------- AI ----------
+          AI_PROVIDER_ORDER: ${{ vars.AI_PROVIDER_ORDER || 'groq' }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'openai/gpt-oss-120b' }}
+
+      - name: Save bot memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dealbot.db
+            deals.csv
+          key: dealbot-state-${{ github.run_id }}
