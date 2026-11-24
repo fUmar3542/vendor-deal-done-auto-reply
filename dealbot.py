@@ -6,8 +6,10 @@ v3.4 changes:
   - As soon as a vendor shares ANY price (their starting quote, e.g. 100$), the bot writes that
     price into the Google Sheet ("Price Quoted ($)", Status "Quote received") and then starts
     negotiating. When a deal is done (e.g. at 30$), the sheet is updated again with the final price.
-  - The starting quote is written only once per vendor (table sheet_logged), so the sheet is not
-    hit on every reply. The deal price always overwrites it.
+  - LIVE tracking: every time the vendor changes their price (e.g. 100 -> 80 -> 60) the sheet is updated,
+    so even without a deal the sheet holds their lowest quote. SHEET_LOWEST_ONLY=1 (default) writes only
+    when the price goes DOWN; SHEET_LOWEST_ONLY=0 writes every change. The deal price always overwrites.
+  - If they give a final price above budget (close_final), that price is written too.
   - If the very first price is already acceptable (deal on the first reply), only the deal price
     is written.
   - Notification emails say "Initial quote" or "Deal done" so you know which stage failed.
@@ -126,6 +128,7 @@ SHEET_WEBAPP_URL = env("SHEET_WEBAPP_URL")            # Apps Script web app URL 
 SHEET_SECRET = env("SHEET_SECRET")                    # same value as SECRET in Code.gs
 NOTIFY_EMAIL = env("NOTIFY_EMAIL", "email@gmail.com")
 NOTIFY_ON_SUCCESS = env("NOTIFY_ON_SUCCESS", "0") == "1"   # also email you when the sheet update worked
+SHEET_LOWEST_ONLY = env("SHEET_LOWEST_ONLY", "1") == "1"   # live updates: only write when the vendor price drops (1) or on every change (0)
 
 OPEN_PRICE = float(env("OPEN_PRICE", "10"))   # first counter-offer
 MAX_PRICE = float(env("MAX_PRICE", "20"))     # hard ceiling (USD per article)
@@ -1264,16 +1267,24 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         mark_read(imap, uid, dry)
         return "skipped"
 
-    # v3.4: vendor shared a price -> write THEIR starting quote to the sheet once, then keep negotiating.
+    # v3.4: live sheet tracking. Every time the vendor shares a (new) price, write THEIR price to the sheet,
+    # then keep negotiating. So the sheet always holds their latest/lowest quote even if no deal happens.
     # If this email already ends in a deal, the deal write below handles it, so skip here.
     if price is not None and outcome != "deal":
-        already = db.execute("SELECT 1 FROM sheet_logged WHERE vendor=?", (vendor,)).fetchone()
-        if not already:
+        lg = db.execute("SELECT price FROM sheet_logged WHERE vendor=?", (vendor,)).fetchone()
+        last_logged = lg[0] if lg else None
+        if last_logged is None:
+            should_write = True
+        elif SHEET_LOWEST_ONLY:
+            should_write = price < last_logged - 0.01          # only when they come down
+        else:
+            should_write = abs(price - last_logged) > 0.01     # any change
+        if should_write:
             ok = sheet_update(db, imap, vendor, from_addr, msg, price, from_name, an["dofollow"], dry, stage="quote")
-            if not dry:   # recorded even on failure, so the owner is emailed once, not on every reply
+            if not dry:   # recorded even on failure, so the owner is emailed once per new price, not on every reply
                 db.execute("INSERT OR REPLACE INTO sheet_logged VALUES(?,?,?)", (vendor, price, time.time()))
                 db.commit()
-                log(f"  starting quote ${price:g} {'written to' if ok else 'NOT written to'} the sheet")
+                log(f"  vendor price ${price:g} {'written to' if ok else 'NOT written to'} the sheet")
 
     # AI call 2: write the email
     body, wprov = compose(db, mode, out_price, history, an["questions"], an["dofollow"] is True)
