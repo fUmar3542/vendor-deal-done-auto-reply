@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-RankZeek guest-post deal bot v3.3  (mailbox: info@rankzeek.com)  -  fully automatic
+RankZeek guest-post deal bot v3.4  (mailbox: info@rankzeek.com)  -  fully automatic
+
+v3.4 changes:
+  - As soon as a vendor shares ANY price (their starting quote, e.g. 100$), the bot writes that
+    price into the Google Sheet ("Price Quoted ($)", Status "Quote received") and then starts
+    negotiating. When a deal is done (e.g. at 30$), the sheet is updated again with the final price.
+  - The starting quote is written only once per vendor (table sheet_logged), so the sheet is not
+    hit on every reply. The deal price always overwrites it.
+  - If the very first price is already acceptable (deal on the first reply), only the deal price
+    is written.
+  - Notification emails say "Initial quote" or "Deal done" so you know which stage failed.
 
 v3.3 changes:
   - New LAST strategy: when the vendor's price is far above our budget and they will not move
@@ -183,6 +193,7 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS sent_log(id INTEGER PRIMARY KEY AUTOINCREMENT, vendor TEXT, ts REAL, kind TEXT, price REAL);
         CREATE TABLE IF NOT EXISTS scheduled(message_id TEXT PRIMARY KEY, due REAL);
         CREATE TABLE IF NOT EXISTS vendor_prices(id INTEGER PRIMARY KEY AUTOINCREMENT, vendor TEXT, ts REAL, price REAL);
+        CREATE TABLE IF NOT EXISTS sheet_logged(vendor TEXT PRIMARY KEY, price REAL, ts REAL);
         """
     )
     db.commit()
@@ -237,7 +248,7 @@ def chat(prov: str, base: str, key: str, model: str, messages: list, temperature
         headers={
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "User-Agent": "rankzeek-dealbot/3.3",  # some providers sit behind Cloudflare
+            "User-Agent": "rankzeek-dealbot/3.4",  # some providers sit behind Cloudflare
         },
     )
     try:
@@ -859,7 +870,9 @@ def print_deal(vendor_name: str, vendor: str, price: float, dofollow, note: str)
 
 
 # ==========================================================================
-# v3.2: write the agreed price back to the Google Sheet after a deal
+# v3.2 / v3.4: write the vendor's price back to the Google Sheet
+#   stage="quote": vendor's starting price (negotiation continues)
+#   stage="deal" : final agreed price (overwrites the quote)
 # ==========================================================================
 def notify(subject: str, lines: list) -> None:
     """Email the owner (NOTIFY_EMAIL). Never raises, so it can never break a run."""
@@ -1008,22 +1021,27 @@ def thread_root_from_sent(imap, cur_msg):
 
 
 def sheet_update(db, imap, vendor: str, from_addr: str, cur_msg, price: float,
-                 vendor_name: str = "", dofollow=None, dry: bool = False) -> None:
-    """After a deal: find the niche tab from our first email, write the price + 'Quote received'.
-    Emails NOTIFY_EMAIL if the row is not found or anything fails. Never raises."""
+                 vendor_name: str = "", dofollow=None, dry: bool = False, stage: str = "deal") -> bool:
+    """Writes `price` + 'Quote received' into the vendor's row in the niche tab.
+    stage='quote' = vendor's first/starting price (negotiation continues)
+    stage='deal'  = final agreed price (overwrites the quote)
+    Emails NOTIFY_EMAIL if the row is not found or anything fails. Never raises. Returns True if written."""
+    is_deal = stage == "deal"
+    label = "Deal done with" if is_deal else "Initial quote from"
     price_txt = fmt_price(price) + "$"
     details = [
         f"Vendor      : {vendor_name or '-'} <{vendor}>",
-        f"Agreed price: {price_txt} per guest post (budget ${fmt_price(OPEN_PRICE)}-${fmt_price(MAX_PRICE)})",
+        f"{'Agreed price' if is_deal else 'Quoted price'}: {price_txt} per guest post (budget ${fmt_price(OPEN_PRICE)}-${fmt_price(MAX_PRICE)})",
+        f"Stage       : {'FINAL DEAL' if is_deal else 'starting quote, negotiation continues'}",
         f"Dofollow    : {({True: 'yes', False: 'NO'}).get(dofollow, 'not confirmed')}",
         f"Time        : {datetime.now().isoformat(timespec='seconds')}",
     ]
     if dry:
-        log(f"  [dry run] would write the price for {anon(vendor)} into the sheet")
-        return
+        log(f"  [dry run] would write the {stage} price for {anon(vendor)} into the sheet")
+        return False
     if not (SHEET_WEBAPP_URL and SHEET_SECRET):
         log("  sheet update skipped: SHEET_WEBAPP_URL / SHEET_SECRET are not set in .env")
-        return
+        return False
     try:
         addrs = [a for a in dict.fromkeys([vendor, from_addr]) if a]
         hint = str(cur_msg.get("Subject") or "") if cur_msg is not None else ""
@@ -1051,33 +1069,38 @@ def sheet_update(db, imap, vendor: str, from_addr: str, cur_msg, price: float,
         niche, how = pick_niche(db, niches, vendor, f_subject, f_body)
         details.append(f"Niche tab   : {niche or '(none)'}  [{how}]")
         if not niche:
-            notify(f"Deal done with {vendor} - niche NOT detected, sheet NOT updated", details + [
+            notify(f"{label} {vendor} - niche NOT detected, sheet NOT updated", details + [
                 "", "Problem: could not match the first email to any niche.",
                 "Available niche tabs: " + ", ".join(niches),
                 f"Please enter {price_txt} for {vendor} in the sheet manually."])
-            return
+            return False
 
         res = sheet_call({"action": "price", "sheet": niche, "emails": emails, "price": price})
         if res.get("ok"):
-            msg = f"sheet updated: '{niche}' row {res.get('row')} ({res.get('matched')}) -> {res.get('written')}, status 'Quote received'"
+            msg = (f"sheet updated ({stage}): '{niche}' row {res.get('row')} ({res.get('matched')}) "
+                   f"-> {res.get('written')}, status 'Quote received'")
             if res.get("previous"):
                 msg += f" (overwrote previous price: {res['previous']})"
-            log("  " + msg)
-            log(f"  sheet updated for {anon(vendor)}" if LOG_PRIVACY else "  " + msg)
-            if not LOG_PRIVACY:
+            if LOG_PRIVACY:
+                log(f"  sheet updated ({stage}) for {anon(vendor)}")
+            else:
+                log("  " + msg)
                 print("SHEET UPDATED: " + msg, flush=True)
             if NOTIFY_ON_SUCCESS:
-                notify(f"Deal done with {vendor} at {price_txt} - sheet updated", details + ["", msg])
+                notify(f"{label} {vendor} at {price_txt} - sheet updated", details + ["", msg])
+            return True
         elif res.get("code") == "not_found":
-            notify(f"Deal done with {vendor} - NOT FOUND in sheet '{niche}'", details + [
+            notify(f"{label} {vendor} - NOT FOUND in sheet '{niche}'", details + [
                 "", f"Problem: none of the emails above exist in the 'Contact Email' column of the '{niche}' tab (exact match required).",
                 f"Please enter {price_txt} for this vendor in the sheet manually."])
+            return False
         else:
             raise RuntimeError(f"Apps Script said: {res.get('error') or res}")
     except Exception as e:
         log(f"  sheet update failed ({type(e).__name__}); details sent by email")
-        notify(f"Deal done with {vendor} - SHEET UPDATE FAILED", details + [
+        notify(f"{label} {vendor} - SHEET UPDATE FAILED", details + [
             "", f"Error: {e!r}", f"Please enter {price_txt} for this vendor in the sheet manually."])
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -1103,7 +1126,7 @@ def close_vendor(db, vendor: str, outcome: str, price, dry: bool) -> None:
 
 
 def reopen(db, vendor: str) -> None:
-    """Forget that a vendor was closed. sent_log is kept, so our last offer is still known."""
+    """Forget that a vendor was closed. sent_log and sheet_logged are kept."""
     vendor = vendor.lower()
     db.execute("DELETE FROM scheduled WHERE message_id IN (SELECT message_id FROM handled WHERE vendor=?)", (vendor,))
     db.execute("DELETE FROM handled WHERE vendor=?", (vendor,))
@@ -1156,7 +1179,7 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         body_now = clean_body(msg)
         amts = money_amounts(body_now)
         if last and last[0] in ("close", "final", "close_final") and amts and max(amts) <= MAX_PRICE and not STOP_RE.search(body_now):
-            log(f"  {vendor} came back with ${min(amts):g}, inside budget; reopening")
+            log(f"  {anon(vendor)} came back with ${min(amts):g}, inside budget; reopening")
             if not dry:
                 reopen(db, vendor)
             row = None
@@ -1241,6 +1264,17 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
         mark_read(imap, uid, dry)
         return "skipped"
 
+    # v3.4: vendor shared a price -> write THEIR starting quote to the sheet once, then keep negotiating.
+    # If this email already ends in a deal, the deal write below handles it, so skip here.
+    if price is not None and outcome != "deal":
+        already = db.execute("SELECT 1 FROM sheet_logged WHERE vendor=?", (vendor,)).fetchone()
+        if not already:
+            ok = sheet_update(db, imap, vendor, from_addr, msg, price, from_name, an["dofollow"], dry, stage="quote")
+            if not dry:   # recorded even on failure, so the owner is emailed once, not on every reply
+                db.execute("INSERT OR REPLACE INTO sheet_logged VALUES(?,?,?)", (vendor, price, time.time()))
+                db.commit()
+                log(f"  starting quote ${price:g} {'written to' if ok else 'NOT written to'} the sheet")
+
     # AI call 2: write the email
     body, wprov = compose(db, mode, out_price, history, an["questions"], an["dofollow"] is True)
     text = assemble(pick_first_name(an, from_name), body)
@@ -1257,8 +1291,8 @@ def process_one(db, imap, uid: bytes, dry: bool) -> str:
     if outcome == "deal":
         print_deal(from_name, vendor, out_price, an["dofollow"], f"agreed after {offers_made} offer(s)")
         close_vendor(db, vendor, "deal_done", out_price, dry)
-        # v3.2: write the price into the Google Sheet (never raises; emails NOTIFY_EMAIL on problems)
-        sheet_update(db, imap, vendor, from_addr, msg, out_price, from_name, an["dofollow"], dry)
+        # write the FINAL agreed price into the sheet (overwrites the starting quote; never raises)
+        sheet_update(db, imap, vendor, from_addr, msg, out_price, from_name, an["dofollow"], dry, stage="deal")
     elif outcome == "ended":
         log(f"CLOSED: {anon(vendor)} - negotiation ended (final message sent).")
         close_vendor(db, vendor, "ended", None, dry)
@@ -1338,7 +1372,7 @@ def main() -> int:
             except ValueError:
                 print("PRICE must be a number, e.g. 15")
                 return 1
-            sheet_update(db, imap, v_email, v_email, None, v_price, "", None, args.dry_run)
+            sheet_update(db, imap, v_email, v_email, None, v_price, "", None, args.dry_run, stage="deal")
             return 0
 
         imap.select("INBOX")
